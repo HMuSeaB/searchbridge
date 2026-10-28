@@ -1,5 +1,7 @@
 # searchbridge
 
+<p align="center"><b>简体中文</b> • <a href="README_EN.md">English</a></p>
+
 给任意 Anthropic Messages 端点**补上原生 `web_search`** 的本地网关：多搜索后端链 + 自动故障转移 + 结果精选。
 
 ZCode / Claude Code 等客户端调用联网搜索时，会发出一个只携带 `web_search` 服务端工具的旁路请求（side request），由模型提供方执行搜索。很多自定义模型端点（例如 StepFun）并不支持这个服务端工具；而 [wbmux](https://github.com/HMuSeaB/wbmux) 这类工具虽然提供搜索端点，却只处理搜索请求、不能当主端点用。
@@ -184,30 +186,3 @@ go vet ./...    # 静态检查
 ## 许可
 
 MIT
-
----
-
-## English
-
-**searchbridge** is a local gateway that adds native `web_search` support to any Anthropic Messages-compatible endpoint, with a built-in multi-backend search chain.
-
-When ZCode / Claude Code perform a web search, they send a side request carrying only the `web_search` server tool, expecting the model provider to execute the search. Many custom endpoints (e.g. StepFun) don't support that server tool, while tools like [wbmux](https://github.com/HMuSeaB/wbmux) provide a search endpoint that only handles search requests and can't serve as the main endpoint.
-
-searchbridge bridges the two, and doesn't depend on any single search source:
-
-- **Chat requests** (no `web_search` tool) are forwarded byte-for-byte to your upstream model endpoint, streaming or not. Client-supplied auth headers are replaced with your configured upstream key.
-- **Search requests** (with a `web_search` tool) go through a prioritized backend chain — `remote` (wbmux-style Anthropic search endpoint), `ddg` (DuckDuckGo Lite), `bing`, `searxng`, `tavily`, `brave`. A failing backend is skipped for a 10-minute cooldown and the next one takes over. Results are synthesized into a standard Anthropic Message (or SSE event stream for streaming clients).
-- **Three chain modes**: `merge` (fixed parallel query of N backends with consensus-weighted merge — quality first), `hedge` (default: sequential start, but if the first backend hasn't answered within `SB_SEARCH_HEDGE_MS` the next one starts in parallel and the first usable result wins — latency first), and plain sequential `failover` (`SB_SEARCH_HEDGE_MS=0`). Backend errors or all-junk results fill the next slot immediately; all-junk never triggers cooldown.
-- **JSON endpoint**: `GET/POST /v1/search?q=...&n=5`, wire-compatible with wbmux's `/v1/search`, for scripts and MCP clients.
-
-Zero dependencies, single binary, configured entirely via environment variables — see the tables above.
-
-```bash
-go build -o searchbridge .
-SB_UPSTREAM_URL="https://api.stepfun.com/step_plan" \
-SB_UPSTREAM_API_KEY="sk-..." \
-./searchbridge
-# point ANTHROPIC_BASE_URL / your custom model base URL at http://127.0.0.1:8787
-```
-
-MIT licensed.
