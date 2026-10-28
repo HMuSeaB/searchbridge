@@ -149,11 +149,14 @@ Backend errors or all-junk results **fill the next slot immediately** (that's fa
 Raw search results mix in plenty of junk — SEO farms, gambling sites, pages unrelated to the query. Feeding those straight to the model pollutes the answer. After each backend returns, the curation layer does four things in order:
 
 1. **Spam filtering**: results whose title/snippet/URL hit strong patterns (gambling, adult content, registration bait) are dropped outright (the pattern list is deliberately conservative — better to miss than to misfire).
-2. **Relevance scoring and grading**: the query is tokenized into the full phrase (weight 3), Latin/digit words and CJK runs (weight 2), and CJK bigrams (weight 1); coverage across title/snippet/URL is computed. `good` = coverage ≥ 0.5 or all main terms hit; `partial` = any hit; `junk` = no hit at all, dropped.
-3. **Deduplication**: normalized URL (scheme/www/query/trailing slash stripped, path kept) plus normalized title — duplicates across engines keep one copy.
-4. **Ranking**: relevance score descending, `good` first, `partial` only as backfill when good results are fewer than the limit.
+2. **Relevance scoring and grading**: the query is tokenized into the full phrase (weight 3), Latin/digit words and CJK runs (weight 2), and CJK bigrams (weight 1); coverage across title/snippet/URL is computed. `good` = coverage ≥ 0.5 or all main terms hit; `partial` = a main term hit but coverage short; `junk` = no hit at all, or **bigram-only hits** (weak signals like 「特性」 mismatch across unrelated contexts too often to count as relevant), dropped.
+3. **Deduplication**: exact normalized-URL dedup (scheme/www/query/trailing slash stripped, path kept) plus **near-duplicate titles** — engines often give the same page different URLs but title variants (the longer one with a 「（完整版）」-style suffix), so titles are compared by token-set containment (smaller set covered ≥ 0.85; titles under 3 tokens are left to exact dedup) and one copy is kept.
+4. **Ranking**: relevance score descending, then re-ranked with three quality signals, `good` first, `partial` only as backfill when good results are fewer than the limit:
+   - **Authoritative domain boost ×1.25**: first-party docs and source repos of languages/frameworks/databases/cloud vendors, Stack Overflow, and similar recognized sources (go.dev, docs.python.org, github.com, developer.mozilla.org, …). Boost only, never filtering — missing one real domain costs more than a missed boost, and no list can be exhaustive.
+   - **Recency weighting**: when the query carries recency intent (「最新」, "latest", 「近期」…), results mentioning the current or previous year get ×1.2, results mentioning only older years ×0.85. Asking for "the latest" shouldn't return a three-year-old tutorial.
+   - **Cross-engine consensus** (merge mode): results returned by k backends get ×(1+0.5(k-1)).
 
-Chain behavior: when a backend's results are **all junk** the next backend is tried, but no cooldown is entered (the backend may still be fine for other queries); only errors and empty results cool down. In merge mode, per-backend results are merged by URL and results returned by k backends get a `1 + 0.5*(k-1)` score boost.
+Chain behavior: when a backend's results are **all junk** the next backend is tried, but no cooldown is entered (the backend may still be fine for other queries); only errors and empty results cool down. In merge mode, per-backend results are merged by URL and the consensus boost applies there too.
 
 ## Routing detection
 

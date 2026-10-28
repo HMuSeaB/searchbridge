@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 // ---------- 分词 ----------
@@ -254,5 +257,135 @@ func TestChainJunkResultsTriggerFailoverWithoutCooldown(t *testing.T) {
 	_, _, _ = chain.Search(context.Background(), "另一个查询", 5)
 	if junkBackend.calls != 1 {
 		t.Errorf("junk backend calls = %d, want 1 (no cooldown after junk)", junkBackend.calls)
+	}
+}
+
+// ---------- 质量信号：权威域名 ----------
+
+func TestDomainBoost(t *testing.T) {
+	cases := []struct {
+		url  string
+		want float64
+	}{
+		{"https://go.dev/doc/go1.24", 1.25},
+		{"https://docs.python.org/3/", 1.25},            // 子域后缀匹配
+		{"https://raw.githubusercontent.com/x/y", 1.25}, // 长子域
+		{"https://stackoverflow.com/questions/1", 1.25},
+		{"https://example.com/page", 1},  // 不在列表
+		{"https://blog.csdn.net/x/y", 1}, // 中立域不加分也不罚
+		{"not a url", 1},                 // 解析不出主机名
+		{"https://go.dev:8443/x", 1.25},  // 带端口
+	}
+	for _, c := range cases {
+		if got := domainBoost(strings.ToLower(c.url)); got != c.want {
+			t.Errorf("domainBoost(%q) = %v, want %v", c.url, got, c.want)
+		}
+	}
+}
+
+func TestScoreResultDomainBoostRanksAuthoritativeFirst(t *testing.T) {
+	tokens := tokenizeQuery("golang 1.24 新特性")
+	phrase := "golang 1.24 新特性"
+	title := "Go 1.24 新特性详解"
+	official := searchResult{Title: title, URL: "https://go.dev/doc/go1.24"}
+	blog := searchResult{Title: title, URL: "https://someblog.example.com/post"}
+
+	scoreOfficial, _ := scoreResult(official, tokens, phrase)
+	scoreBlog, _ := scoreResult(blog, tokens, phrase)
+	if scoreOfficial <= scoreBlog {
+		t.Errorf("权威域名分数 %v 应高于普通站点 %v", scoreOfficial, scoreBlog)
+	}
+}
+
+// ---------- 质量信号：二元组-only 命中降级 ----------
+
+func TestScoreResultBigramOnlyIsJunk(t *testing.T) {
+	tokens := tokenizeQuery("golang 1.24 新特性")
+	phrase := "golang 1.24 新特性"
+	// 只命中二元组「特性」（其他上下文），不含任何主词。
+	r := searchResult{Title: "这个产品的特性说明", URL: "https://example.com"}
+	if _, grade := scoreResult(r, tokens, phrase); grade != gradeJunk {
+		t.Errorf("只命中二元组应判 junk，得到 %v", grade)
+	}
+	// 命中主词「golang」仍是 partial。
+	r2 := searchResult{Title: "golang 入门", URL: "https://example.com"}
+	if _, grade := scoreResult(r2, tokens, phrase); grade != gradePartial {
+		t.Errorf("命中主词应判 partial，得到 %v", grade)
+	}
+}
+
+// ---------- 质量信号：时效 ----------
+
+func TestHasRecencyIntent(t *testing.T) {
+	cases := []struct {
+		query string
+		want  bool
+	}{
+		{"最新的 AI 新闻", true},
+		{"latest golang release", true},
+		{"近期科技动态", true},
+		{"golang 1.24 新特性", false},
+		{"python fastapi 教程", false},
+	}
+	for _, c := range cases {
+		if got := hasRecencyIntent(c.query); got != c.want {
+			t.Errorf("hasRecencyIntent(%q) = %v, want %v", c.query, got, c.want)
+		}
+	}
+}
+
+func TestRecencyBoost(t *testing.T) {
+	cur := time.Now().Year()
+	fresh := searchResult{Title: "发布说明", Snippet: "于 " + strconv.Itoa(cur) + " 年更新"}
+	stale := searchResult{Title: "旧闻", Snippet: strconv.Itoa(cur-5) + " 年的报道"}
+	noDate := searchResult{Title: "无日期", Snippet: "一些内容"}
+
+	if got := recencyBoost(fresh); got != 1.2 {
+		t.Errorf("含当前年应 ×1.2，得到 %v", got)
+	}
+	if got := recencyBoost(stale); got != 0.85 {
+		t.Errorf("只含旧年份应 ×0.85，得到 %v", got)
+	}
+	if got := recencyBoost(noDate); got != 1 {
+		t.Errorf("无年份应不变，得到 %v", got)
+	}
+}
+
+// ---------- 近似重复标题 ----------
+
+func TestNearDupTitle(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{"同页面不同措辞", "Go 1.24 Release Notes - The Go Programming Language", "Go 1.24 Release Notes — The Go Programming Language", true},
+		{"镜像站标题一致", "Golang 1.24 新特性详解", "Golang 1.24 新特性详解（完整版）", true},
+		{"不同主题", "Go 1.24 Release Notes", "Python FastAPI 入门教程", false},
+		{"空标题", "", "Go 1.24", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := nearDupTitle(c.a, c.b); got != c.want {
+				t.Errorf("nearDupTitle(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+			}
+		})
+	}
+}
+
+func TestCurateNearDupDifferentURLs(t *testing.T) {
+	results := []searchResult{
+		{Title: "Go 1.24 Release Notes 官方发布说明", URL: "https://go.dev/doc/go1.24"},
+		{Title: "Go 1.24 Release Notes 官方发布说明", URL: "https://mirror.example.com/doc/go1.24?utm_source=x"},
+		{Title: "完全不同的另一篇内容", URL: "https://other.example.com"},
+	}
+	curated, stats := curate(results, "Go 1.24 release notes", 5)
+	if stats.Deduped < 1 {
+		t.Errorf("近似重复应被去重，stats = %+v", stats)
+	}
+	for _, cr := range curated {
+		if strings.Contains(cr.URL, "mirror.example.com") {
+			t.Errorf("镜像副本应被去掉，保留首个高分版本")
+		}
 	}
 }

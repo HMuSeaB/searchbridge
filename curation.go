@@ -3,7 +3,9 @@ package main
 import (
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // 精选层：搜索引擎返回的结果里混有大量垃圾（SEO 农场、赌博站、不相关内容），
@@ -148,10 +150,10 @@ func isSpam(r searchResult) bool {
 // scoreResult 计算单个结果与查询的相关性。
 // 分级规则：
 //   - good：覆盖率 ≥ 0.5，或主词（权重 ≥ 2 的整词/整段/短语）全部命中
-//   - partial：有任意命中
-//   - junk：完全无命中
+//   - partial：有主词命中但覆盖率不足
+//   - junk：完全无命中，或只命中二元组（权重 1 的弱信号，跨语句误配概率高）
 //
-// 标题命中与完整短语命中提升排序分。
+// 标题命中与完整短语命中提升排序分；权威域名与时效信号做乘性加权。
 func scoreResult(r searchResult, tokens []qtoken, phrase string) (float64, resultGrade) {
 	if len(tokens) == 0 {
 		return 1, gradeGood
@@ -188,7 +190,8 @@ func scoreResult(r searchResult, tokens []qtoken, phrase string) (float64, resul
 			rank += t.weight * 0.5
 		}
 	}
-	if matched == 0 {
+	if matched == 0 || matchedHigh == 0 {
+		// 只命中二元组（如「特性」出现在无关上下文）不足以构成相关。
 		return 0, gradeJunk
 	}
 	coverage := matched / total
@@ -202,6 +205,12 @@ func scoreResult(r searchResult, tokens []qtoken, phrase string) (float64, resul
 	// 归一化到 0..1 附近，避免长查询把分数撑得过高。
 	score := coverage + rank/(total*10)
 
+	// 质量信号：权威域名加权 × 时效加权。
+	score *= domainBoost(url)
+	if hasRecencyIntent(phrase) {
+		score *= recencyBoost(r)
+	}
+
 	var grade resultGrade
 	switch {
 	case coverage >= 0.5 || highCoverage >= 0.99:
@@ -210,6 +219,161 @@ func scoreResult(r searchResult, tokens []qtoken, phrase string) (float64, resul
 		grade = gradePartial
 	}
 	return score, grade
+}
+
+// ---------- 质量信号：权威域名 ----------
+
+// authoritativeDomains 是公认的第一方/开发文档/问答站点。对编程代理来说，
+// 结果来源的可信度往往比关键词覆盖更能决定答案质量——官方文档和源码库
+// 应当排在内容农场前面。这里只做「加权」不做「过滤」：漏杀一个真实域名
+// 的代价远大于漏杀，且列表不可能穷尽。
+var authoritativeDomains = map[string]bool{
+	// 语言与包管理官方
+	"go.dev": true, "pkg.go.dev": true, "docs.rs": true, "doc.rust-lang.org": true,
+	"rust-lang.org": true, "crates.io": true, "python.org": true, "docs.python.org": true,
+	"pypi.org": true, "nodejs.org": true, "npmjs.com": true, "docs.npmjs.com": true,
+	"typescriptlang.org": true, "cppreference.com": true, "isocpp.org": true,
+	"cplusplus.com": true, "rubyonrails.org": true, "guides.rubyonrails.org": true,
+	"laravel.com": true, "spring.io": true, "kotlinlang.org": true, "swift.org": true,
+	"oracle.com": true, "docs.oracle.com": true,
+	// Web 与框架官方
+	"developer.mozilla.org": true, "mdn.dev": true, "react.dev": true, "reactjs.org": true,
+	"vuejs.org": true, "angular.io": true, "svelte.dev": true, "jquery.com": true,
+	"webpack.js.org": true, "vitejs.dev": true, "babeljs.io": true,
+	// 代码托管与问答
+	"github.com": true, "raw.githubusercontent.com": true, "gist.github.com": true,
+	"gitlab.com": true, "stackoverflow.com": true, "serverfault.com": true,
+	"superuser.com": true, "stackexchange.com": true,
+	// 数据库与基础设施官方
+	"postgresql.org": true, "mysql.com": true, "docs.mysql.com": true, "mongodb.com": true,
+	"redis.io": true, "sqlite.org": true, "elastic.co": true, "nginx.org": true,
+	"kubernetes.io": true, "docs.docker.com": true, "docker.com": true,
+	"apache.org": true, "kernel.org": true, "gnu.org": true, "wikipedia.org": true,
+	// 云与模型厂商官方
+	"cloud.google.com": true, "docs.aws.amazon.com": true, "aws.amazon.com": true,
+	"azure.microsoft.com": true, "learn.microsoft.com": true, "docs.microsoft.com": true,
+	"microsoft.com": true, "openai.com": true, "anthropic.com": true, "deepmind.google": true,
+	"huggingface.co": true,
+}
+
+// domainBoost 按主机名后缀匹配权威域名列表，命中返回 1.25 的加权系数。
+func domainBoost(lowerURL string) float64 {
+	host := urlHost(lowerURL)
+	if host == "" {
+		return 1
+	}
+	for domain := range authoritativeDomains {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return 1.25
+		}
+	}
+	return 1
+}
+
+// urlHost 提取 URL 的小写主机名（尽力而为，失败返回空串）。
+func urlHost(rawURL string) string {
+	u := strings.ToLower(strings.TrimSpace(rawURL))
+	if i := strings.Index(u, "://"); i != -1 {
+		u = u[i+3:]
+	}
+	if i := strings.IndexAny(u, "/?#"); i != -1 {
+		u = u[:i]
+	}
+	if i := strings.LastIndex(u, "@"); i != -1 { // 剥掉 userinfo@
+		u = u[i+1:]
+	}
+	if i := strings.LastIndex(u, ":"); i != -1 { // 剥掉端口
+		u = u[:i]
+	}
+	return strings.TrimPrefix(u, "www.")
+}
+
+// ---------- 质量信号：时效 ----------
+
+// recencyKeywords 是查询里的时效意图信号。命中说明用户在问「最新」，
+// 此时结果的新旧应当参与排序。
+var recencyKeywords = []string{
+	"最新", "近期", "最近", "今年", "当今", "现如今", "当前", "今天", "本周", "本月", "新版",
+	"latest", "news", "recent", "current", "today", "this week", "this month", "new release",
+}
+
+func hasRecencyIntent(phrase string) bool {
+	q := strings.ToLower(phrase)
+	for _, kw := range recencyKeywords {
+		if strings.Contains(q, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// recencyBoost 时效加权：结果文本提及当前年或去年 → ×1.2；只提及更早的
+// 年份 → ×0.85（可能已过时）；无年份信息 → 不变。查询无时效意图时不调用。
+func recencyBoost(r searchResult) float64 {
+	text := strings.ToLower(r.Title + " " + r.Snippet)
+	cur := time.Now().Year()
+	for _, y := range []int{cur, cur - 1} {
+		if strings.Contains(text, strconv.Itoa(y)) {
+			return 1.2
+		}
+	}
+	for y := 2015; y <= cur-2; y++ {
+		if strings.Contains(text, strconv.Itoa(y)) {
+			return 0.85
+		}
+	}
+	return 1
+}
+
+// ---------- 近似重复标题 ----------
+
+// titleTokens 把标题切成拉丁词 + CJK 二元组集合，用于近似去重。
+func titleTokens(title string) map[string]bool {
+	set := make(map[string]bool)
+	lower := strings.ToLower(title)
+	for _, w := range latinRunRe.FindAllString(lower, -1) {
+		set[w] = true
+	}
+	for _, run := range cjkRunRe.FindAllString(lower, -1) {
+		runes := []rune(run)
+		for i := 0; i+2 <= len(runes); i++ {
+			set[string(runes[i:i+2])] = true
+		}
+	}
+	return set
+}
+
+// nearDupTitle 判断两个标题是否近似重复。用「包含度」而非 Jaccard：
+// 跨引擎对同一页面常给出标题的详略变体（长的多一个「（完整版）」
+// 「- 知乎」之类的后缀），Jaccard 会被多出的token稀释到阈值之下，
+// 而较小集合被较大集合高比例覆盖正是这类变体的特征。
+// 少于 3 个 token 的标题不足以判定，交给精确去重，避免误杀短标题。
+func nearDupTitle(a, b string) bool {
+	ta, tb := titleTokens(a), titleTokens(b)
+	if len(ta) < 3 || len(tb) < 3 {
+		return false
+	}
+	inter := 0
+	for t := range ta {
+		if tb[t] {
+			inter++
+		}
+	}
+	smaller := len(ta)
+	if len(tb) < smaller {
+		smaller = len(tb)
+	}
+	return float64(inter)/float64(smaller) >= 0.85
+}
+
+// nearDupAny 判断标题是否与已有标题列表中的任何一个近似重复。
+func nearDupAny(title string, kept []string) bool {
+	for _, k := range kept {
+		if nearDupTitle(title, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------- 规范化与去重 ----------
@@ -247,7 +411,7 @@ func curate(results []searchResult, query string, limit int) ([]curatedResult, c
 	phrase := strings.Join(strings.Fields(strings.ToLower(query)), " ")
 
 	seenURL := make(map[string]bool)
-	seenTitle := make(map[string]bool)
+	var keptTitles []string // 已保留结果的标题，用于近似去重
 	var goods, partials []curatedResult
 
 	for _, r := range results {
@@ -262,18 +426,19 @@ func curate(results []searchResult, query string, limit int) ([]curatedResult, c
 			}
 			seenURL[nu] = true
 		}
-		if nt := normalizeTitle(r.Title); nt != "" {
-			if seenTitle[nt] {
-				stats.Deduped++
-				continue
-			}
-			seenTitle[nt] = true
+		// 近似去重：跨引擎对同一页面常给出不同 URL 但标题几乎一致，
+		// 与已保留的标题做 Jaccard 判定，重复的丢弃（保留先到的高分版本
+		// 由后续排序保证——先到者通常是链路上更靠前的源）。
+		if nearDupAny(r.Title, keptTitles) {
+			stats.Deduped++
+			continue
 		}
 		score, grade := scoreResult(r, tokens, phrase)
 		if grade == gradeJunk {
 			stats.Junk++
 			continue
 		}
+		keptTitles = append(keptTitles, r.Title)
 		cr := curatedResult{searchResult: r, score: score, grade: grade}
 		if grade == gradeGood {
 			goods = append(goods, cr)
