@@ -2,6 +2,8 @@
 /searchbridge
 /searchbridge.exe
 *.exe
+*.exe~
+*~
 
 # 本地配置（含密钥，勿提交）
 .env
