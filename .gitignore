@@ -1,0 +1,13 @@
+# 构建产物
+/searchbridge
+/searchbridge.exe
+*.exe
+
+# 本地配置（含密钥，勿提交）
+.env
+config.local.yaml
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
