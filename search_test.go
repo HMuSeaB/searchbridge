@@ -12,7 +12,7 @@ import (
 
 func TestChainTriesBackendsInOrder(t *testing.T) {
 	failing := &stubBackend{name: "failing", err: errors.New("boom")}
-	ok := &stubBackend{name: "ok", results: []searchResult{{Title: "T", URL: "https://a"}}}
+	ok := &stubBackend{name: "ok", results: []searchResult{{Title: "query 结果", URL: "https://a.example"}}}
 	chain := newBackendChain([]searchBackend{failing, ok}, 10*time.Minute, 30*time.Minute)
 
 	results, via, err := chain.Search(context.Background(), "query", 5)
@@ -29,15 +29,15 @@ func TestChainTriesBackendsInOrder(t *testing.T) {
 
 func TestChainSkipsCooldownBackends(t *testing.T) {
 	failing := &stubBackend{name: "failing", err: errors.New("boom")}
-	ok := &stubBackend{name: "ok", results: []searchResult{{Title: "T", URL: "https://a"}}}
+	ok := &stubBackend{name: "ok", results: []searchResult{{Title: "query 结果", URL: "https://a.example"}}}
 	chain := newBackendChain([]searchBackend{failing, ok}, 10*time.Minute, 0)
 
 	// 第一次：failing 失败一次，进入冷却。
-	if _, _, err := chain.Search(context.Background(), "q1", 5); err != nil {
+	if _, _, err := chain.Search(context.Background(), "query one", 5); err != nil {
 		t.Fatalf("first search error = %v", err)
 	}
 	// 第二次（不同查询，绕过缓存）：failing 应在冷却期内被跳过。
-	if _, via, err := chain.Search(context.Background(), "q2", 5); err != nil {
+	if _, via, err := chain.Search(context.Background(), "query two", 5); err != nil {
 		t.Fatalf("second search error = %v", err)
 	} else if via != "ok" {
 		t.Errorf("via = %q, want ok", via)
@@ -51,7 +51,7 @@ func TestChainSkipsCooldownBackends(t *testing.T) {
 }
 
 func TestChainCacheHits(t *testing.T) {
-	backend := &stubBackend{name: "b", results: []searchResult{{Title: "T", URL: "https://a"}}}
+	backend := &stubBackend{name: "b", results: []searchResult{{Title: "query 结果", URL: "https://a.example"}}}
 	chain := newBackendChain([]searchBackend{backend}, 10*time.Minute, 30*time.Minute)
 
 	for i := 0; i < 3; i++ {
@@ -73,10 +73,43 @@ func TestChainAllCooldown(t *testing.T) {
 	failing := &stubBackend{name: "failing", err: errors.New("boom")}
 	chain := newBackendChain([]searchBackend{failing}, 10*time.Minute, 0)
 
-	_, _, _ = chain.Search(context.Background(), "q1", 5)
-	_, _, err := chain.Search(context.Background(), "q2", 5)
+	_, _, _ = chain.Search(context.Background(), "query one", 5)
+	_, _, err := chain.Search(context.Background(), "query two", 5)
 	if err == nil {
 		t.Fatal("expected error when all backends are in cooldown")
+	}
+}
+
+func TestChainMergeMode(t *testing.T) {
+	a := &stubBackend{name: "a", results: []searchResult{
+		{Title: "query 共享结果", URL: "https://example.com/shared"},
+		{Title: "query A 独有", URL: "https://a.com/only"},
+	}}
+	b := &stubBackend{name: "b", results: []searchResult{
+		{Title: "query 共享结果", URL: "https://www.example.com/shared"},
+		{Title: "query B 独有", URL: "https://b.com/only"},
+	}}
+	chain := newBackendChain([]searchBackend{a, b}, 10*time.Minute, 0)
+	chain.merge = true
+	chain.mergeWidth = 2
+
+	results, via, err := chain.Search(context.Background(), "query 测试", 5)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	// 两个后端都成功（完成顺序不定，via 顺序不保证）。
+	if via != "a+b" && via != "b+a" {
+		t.Errorf("via = %q, want a+b or b+a", via)
+	}
+	if len(results) != 3 {
+		t.Fatalf("results = %d, want 3 (shared deduped)", len(results))
+	}
+	// 共识结果（两个后端都返回）应排第一，保留哪个副本均可。
+	if normalizeURL(results[0].URL) != "example.com/shared" {
+		t.Errorf("results[0] = %s, want shared (consensus boost)", results[0].URL)
+	}
+	if a.calls != 1 || b.calls != 1 {
+		t.Errorf("calls: a=%d b=%d, want 1/1", a.calls, b.calls)
 	}
 }
 

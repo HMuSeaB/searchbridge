@@ -29,13 +29,16 @@ type searchBackend interface {
 //   - 查询结果按 (query, limit) 缓存（默认 30 分钟），避免重复请求；
 //   - 全部后端失败时才返回错误。
 type backendChain struct {
-	backends []searchBackend
-	cooldown time.Duration
-	cacheTTL time.Duration
+	backends   []searchBackend
+	cooldown   time.Duration
+	cacheTTL   time.Duration
+	merge      bool
+	mergeWidth int
 
-	mu       sync.Mutex
-	failedAt map[string]time.Time
-	cache    map[string]cacheEntry
+	mu        sync.Mutex
+	failedAt  map[string]time.Time
+	cache     map[string]cacheEntry
+	lastStats curationStats
 }
 
 type cacheEntry struct {
@@ -54,6 +57,7 @@ func newBackendChain(backends []searchBackend, cooldown, cacheTTL time.Duration)
 		backends: backends,
 		cooldown: cooldown,
 		cacheTTL: cacheTTL,
+		merge:    false,
 		failedAt: make(map[string]time.Time),
 		cache:    make(map[string]cacheEntry),
 	}
@@ -68,7 +72,10 @@ func (c *backendChain) Names() []string {
 	return names
 }
 
-// Search 依次尝试链路中的后端，返回首个成功的结果。
+// Search 依次尝试链路中的后端；每个后端的结果都会经过精选（垃圾过滤 /
+// 相关性分级 / 去重 / 排序）。全垃圾的结果会触发下一个后端，但不进入冷却
+// （该后端对其他查询可能仍然可用）；错误与空结果才进入冷却。
+// merge 模式下改为多后端并行查询 + 共识加权合并。
 func (c *backendChain) Search(ctx context.Context, query string, limit int) ([]searchResult, string, error) {
 	key := fmt.Sprintf("%d|%s", limit, query)
 
@@ -79,6 +86,10 @@ func (c *backendChain) Search(ctx context.Context, query string, limit int) ([]s
 		return results, "cache", nil
 	}
 	c.mu.Unlock()
+
+	if c.merge {
+		return c.searchMerged(ctx, query, limit, key)
+	}
 
 	var lastErr error
 	for _, b := range c.backends {
@@ -100,13 +111,24 @@ func (c *backendChain) Search(ctx context.Context, query string, limit int) ([]s
 			lastErr = fmt.Errorf("backend %s returned no results", b.Name())
 			continue
 		}
+		curated, stats := curate(results, query, limit)
+		if !hasUsableResults(curated) {
+			// 全是垃圾/不相关：不冷却（换个查询它可能就正常），直接试下一个。
+			log.Printf("[search] backend %s returned only junk (good=%d partial=%d junk=%d deduped=%d), trying next",
+				b.Name(), stats.Good, stats.Partial, stats.Junk, stats.Deduped)
+			lastErr = fmt.Errorf("backend %s returned only irrelevant results", b.Name())
+			continue
+		}
 		c.markOK(b.Name())
-		log.Printf("[search] backend %s returned %d results in %s", b.Name(), len(results), time.Since(start).Round(time.Millisecond))
+		log.Printf("[search] backend %s returned %d results in %s, curated good=%d partial=%d junk=%d deduped=%d",
+			b.Name(), len(results), time.Since(start).Round(time.Millisecond), stats.Good, stats.Partial, stats.Junk, stats.Deduped)
 
+		out := curatedToResults(curated)
 		c.mu.Lock()
-		c.cache[key] = cacheEntry{results: results, storedAt: time.Now()}
+		c.lastStats = stats
+		c.cache[key] = cacheEntry{results: out, storedAt: time.Now()}
 		c.mu.Unlock()
-		return results, b.Name(), nil
+		return out, b.Name(), nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("all search backends are in cooldown")
@@ -114,11 +136,122 @@ func (c *backendChain) Search(ctx context.Context, query string, limit int) ([]s
 	return nil, "", lastErr
 }
 
+// searchMerged 并行查询最多 mergeWidth 个健康后端，各自精选后按
+// 共识加权合并。某个后端失败/全垃圾不影响其他后端的结果。
+func (c *backendChain) searchMerged(ctx context.Context, query string, limit int, key string) ([]searchResult, string, error) {
+	c.mu.Lock()
+	var picked []searchBackend
+	for _, b := range c.backends {
+		if len(picked) >= c.mergeWidth {
+			break
+		}
+		if !c.inCooldownLocked(b.Name()) {
+			picked = append(picked, b)
+		}
+	}
+	c.mu.Unlock()
+
+	if len(picked) == 0 {
+		return nil, "", fmt.Errorf("all search backends are in cooldown")
+	}
+
+	type outcome struct {
+		name    string
+		curated []curatedResult
+		stats   curationStats
+		err     error
+	}
+	ch := make(chan outcome, len(picked))
+	for _, b := range picked {
+		go func(b searchBackend) {
+			start := time.Now()
+			results, err := b.Search(ctx, query, limit)
+			if err != nil {
+				log.Printf("[search] backend %s failed after %s: %v", b.Name(), time.Since(start).Round(time.Millisecond), err)
+				ch <- outcome{name: b.Name(), err: err}
+				return
+			}
+			if len(results) == 0 {
+				ch <- outcome{name: b.Name(), err: fmt.Errorf("no results")}
+				return
+			}
+			curated, stats := curate(results, query, limit)
+			for i := range curated {
+				curated[i].sources = []string{b.Name()}
+			}
+			log.Printf("[search] backend %s returned %d results in %s, curated good=%d partial=%d junk=%d deduped=%d",
+				b.Name(), len(results), time.Since(start).Round(time.Millisecond), stats.Good, stats.Partial, stats.Junk, stats.Deduped)
+			ch <- outcome{name: b.Name(), curated: curated, stats: stats}
+		}(b)
+	}
+
+	var perBackend [][]curatedResult
+	var used []string
+	var lastErr error
+	var agg curationStats
+	for range picked {
+		o := <-ch
+		if o.err != nil {
+			c.markFailed(o.name)
+			lastErr = o.err
+			continue
+		}
+		agg.Total += o.stats.Total
+		agg.Good += o.stats.Good
+		agg.Partial += o.stats.Partial
+		agg.Junk += o.stats.Junk
+		agg.Deduped += o.stats.Deduped
+		if len(o.curated) == 0 {
+			continue // 全垃圾，不冷却
+		}
+		c.markOK(o.name)
+		perBackend = append(perBackend, o.curated)
+		used = append(used, o.name)
+	}
+	if len(perBackend) == 0 {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no backend returned relevant results")
+		}
+		return nil, "", lastErr
+	}
+
+	merged := mergeCurated(perBackend, limit)
+	out := curatedToResults(merged)
+	via := strings.Join(used, "+")
+	c.mu.Lock()
+	c.lastStats = agg
+	c.cache[key] = cacheEntry{results: out, storedAt: time.Now()}
+	c.mu.Unlock()
+	log.Printf("[search] merged %d results from %s", len(out), via)
+	return out, via, nil
+}
+
+// curatedToResults 去掉评分包装，返回纯结果列表。
+func curatedToResults(curated []curatedResult) []searchResult {
+	out := make([]searchResult, len(curated))
+	for i, cr := range curated {
+		out[i] = cr.searchResult
+	}
+	return out
+}
+
+// LastStats 返回最近一次搜索的精选统计（供 /v1/search 端点暴露质量信息）。
+func (c *backendChain) LastStats() curationStats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastStats
+}
+
+// inCooldownLocked 是 inCooldown 的无锁版本，调用方必须已持有 c.mu。
+func (c *backendChain) inCooldownLocked(name string) bool {
+	at, ok := c.failedAt[name]
+	return ok && time.Since(at) < c.cooldown
+}
+
 func (c *backendChain) inCooldown(name string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	at, ok := c.failedAt[name]
-	return ok && time.Since(at) < c.cooldown
+	return c.inCooldownLocked(name)
 }
 
 func (c *backendChain) markFailed(name string) {

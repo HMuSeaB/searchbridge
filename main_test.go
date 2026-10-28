@@ -140,9 +140,9 @@ func stubResults(n int) []searchResult {
 	results := make([]searchResult, n)
 	for i := range results {
 		results[i] = searchResult{
-			Title:   "结果 " + string(rune('A'+i)),
+			Title:   "测试关键词 结果 " + string(rune('A'+i)),
 			URL:     "https://example.com/" + string(rune('a'+i)),
-			Snippet: "摘要 " + string(rune('A'+i)),
+			Snippet: "关于测试关键词的摘要 " + string(rune('A'+i)),
 		}
 	}
 	return results
@@ -154,7 +154,7 @@ func TestSearchRequestUsesBackendChain(t *testing.T) {
 	primary := &stubBackend{name: "primary", results: stubResults(3)}
 	srv := newTestServer(t, "http://upstream.invalid", primary)
 
-	reqBody := `{"model":"step-5-preview","max_tokens":4096,"messages":[{"role":"user","content":"Perform a web search for the query: 测试查询"}],` +
+	reqBody := `{"model":"step-5-preview","max_tokens":4096,"messages":[{"role":"user","content":"Perform a web search for the query: 测试关键词"}],` +
 		`"tools":[{"type":"web_search_20260209","name":"web_search","max_uses":3}]}`
 
 	rec := doJSON(t, srv, http.MethodPost, "/v1/messages", reqBody, map[string]string{
@@ -182,7 +182,7 @@ func TestSearchRequestStreamSynthesizesSSE(t *testing.T) {
 	primary := &stubBackend{name: "primary", results: stubResults(2)}
 	srv := newTestServer(t, "http://upstream.invalid", primary)
 
-	reqBody := `{"model":"step-5-preview","stream":true,"messages":[{"role":"user","content":"Perform a web search for the query: 流式测试"}],` +
+	reqBody := `{"model":"step-5-preview","stream":true,"messages":[{"role":"user","content":"Perform a web search for the query: 测试关键词"}],` +
 		`"tools":[{"type":"web_search_20260209","name":"web_search"}]}`
 
 	rec := doJSON(t, srv, http.MethodPost, "/v1/messages", reqBody, nil)
@@ -236,7 +236,7 @@ func TestSearchJSONEndpoint(t *testing.T) {
 	primary := &stubBackend{name: "primary", results: stubResults(2)}
 	srv := newTestServer(t, "http://upstream.invalid", primary)
 
-	rec := doJSON(t, srv, http.MethodGet, "/v1/search?q=json%20endpoint&n=2", ``, nil)
+	rec := doJSON(t, srv, http.MethodGet, "/v1/search?q=%E6%B5%8B%E8%AF%95%E5%85%B3%E9%94%AE%E8%AF%8D&n=2", ``, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -249,7 +249,7 @@ func TestSearchJSONEndpoint(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("invalid JSON: %v", err)
 	}
-	if !payload.OK || payload.Query != "json endpoint" || payload.Via != "primary" || len(payload.Results) != 2 {
+	if !payload.OK || payload.Query != "测试关键词" || payload.Via != "primary" || len(payload.Results) != 2 {
 		t.Errorf("unexpected payload: %s", rec.Body.String())
 	}
 

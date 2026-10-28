@@ -36,11 +36,13 @@ type config struct {
 	upstreamAPIKey string // 上游 API Key（可选，以 x-api-key 发送）
 	upstreamBearer bool   // true 时以 Authorization: Bearer 发送上游 Key
 
-	searchURL      string        // 搜索端点（remote 后端），默认 wbmux 的 /v1/search/messages
-	searchAPIKey   string        // 搜索端点 Key（可选；wbmux 本机回环免密）
-	searchBackends string        // 搜索后端链（顺序即优先级），默认 remote,ddg,bing
-	searchCooldown time.Duration // 后端失败后的冷却时间
-	searchCacheTTL time.Duration // 搜索结果缓存时间
+	searchURL       string        // 搜索端点（remote 后端），默认 wbmux 的 /v1/search/messages
+	searchAPIKey    string        // 搜索端点 Key（可选；wbmux 本机回环免密）
+	searchBackends  string        // 搜索后端链（顺序即优先级），默认 remote,ddg,bing
+	searchCooldown  time.Duration // 后端失败后的冷却时间
+	searchCacheTTL  time.Duration // 搜索结果缓存时间
+	searchMerge     bool          // 合并模式：多后端并行查询 + 共识加权
+	searchMergeWide int           // 合并模式同时查询的后端数
 }
 
 func loadConfig() config {
@@ -50,11 +52,13 @@ func loadConfig() config {
 		upstreamAPIKey: env("SB_UPSTREAM_API_KEY", ""),
 		upstreamBearer: env("SB_UPSTREAM_BEARER", "") == "1",
 
-		searchURL:      searchURLEnv(),
-		searchAPIKey:   env("SB_SEARCH_API_KEY", ""),
-		searchBackends: env("SB_SEARCH_BACKENDS", ""),
-		searchCooldown: time.Duration(envInt("SB_SEARCH_COOLDOWN_MIN", 10)) * time.Minute,
-		searchCacheTTL: time.Duration(envInt("SB_SEARCH_CACHE_MIN", 30)) * time.Minute,
+		searchURL:       searchURLEnv(),
+		searchAPIKey:    env("SB_SEARCH_API_KEY", ""),
+		searchBackends:  env("SB_SEARCH_BACKENDS", ""),
+		searchCooldown:  time.Duration(envInt("SB_SEARCH_COOLDOWN_MIN", 10)) * time.Minute,
+		searchCacheTTL:  time.Duration(envInt("SB_SEARCH_CACHE_MIN", 30)) * time.Minute,
+		searchMerge:     env("SB_SEARCH_MERGE", "") == "1",
+		searchMergeWide: envInt("SB_SEARCH_MERGE_WIDTH", 3),
 	}
 }
 
@@ -163,6 +167,8 @@ type server struct {
 func newServer(cfg config) *server {
 	backends := buildBackends(cfg)
 	chain := newBackendChain(backends, cfg.searchCooldown, cfg.searchCacheTTL)
+	chain.merge = cfg.searchMerge
+	chain.mergeWidth = cfg.searchMergeWide
 	return &server{
 		cfg:    cfg,
 		client: &http.Client{},
@@ -389,6 +395,7 @@ func (s *server) handleSearchJSON(w http.ResponseWriter, r *http.Request) {
 		"query":            query,
 		"via":              via,
 		"results":          results,
+		"stats":            s.chain.LastStats(),
 		"response_time_ms": time.Since(start).Milliseconds(),
 	})
 }
