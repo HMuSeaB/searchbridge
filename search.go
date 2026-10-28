@@ -28,12 +28,19 @@ type searchBackend interface {
 //   - 某个后端失败后进入冷却期（默认 10 分钟），期间直接跳过；
 //   - 查询结果按 (query, limit) 缓存（默认 30 分钟），避免重复请求；
 //   - 全部后端失败时才返回错误。
+//
+// 三种模式（按优先级）：
+//   - merge：多后端并行查询 + 共识加权合并（质量优先）；
+//   - hedge：首后端超过对冲窗口未返回即并行启动下一个，先出可用
+//     结果者胜出（延迟优先，失败仍立刻补位）；
+//   - 默认：串行 failover。
 type backendChain struct {
 	backends   []searchBackend
 	cooldown   time.Duration
 	cacheTTL   time.Duration
 	merge      bool
 	mergeWidth int
+	hedgeDelay time.Duration
 
 	mu        sync.Mutex
 	failedAt  map[string]time.Time
@@ -75,7 +82,8 @@ func (c *backendChain) Names() []string {
 // Search 依次尝试链路中的后端；每个后端的结果都会经过精选（垃圾过滤 /
 // 相关性分级 / 去重 / 排序）。全垃圾的结果会触发下一个后端，但不进入冷却
 // （该后端对其他查询可能仍然可用）；错误与空结果才进入冷却。
-// merge 模式下改为多后端并行查询 + 共识加权合并。
+// merge 模式下改为多后端并行查询 + 共识加权合并；hedge 模式下首后端
+// 超过 hedgeDelay 未返回即并行对冲下一个，先出可用结果者胜出。
 func (c *backendChain) Search(ctx context.Context, query string, limit int) ([]searchResult, string, error) {
 	key := fmt.Sprintf("%d|%s", limit, query)
 
@@ -89,6 +97,9 @@ func (c *backendChain) Search(ctx context.Context, query string, limit int) ([]s
 
 	if c.merge {
 		return c.searchMerged(ctx, query, limit, key)
+	}
+	if c.hedgeDelay > 0 {
+		return c.searchHedged(ctx, query, limit, key)
 	}
 
 	var lastErr error
@@ -132,6 +143,124 @@ func (c *backendChain) Search(ctx context.Context, query string, limit int) ([]s
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("all search backends are in cooldown")
+	}
+	return nil, "", lastErr
+}
+
+// searchHedged 对冲竞速：先启动首后端；若 hedgeDelay 内没有产出可用结果，
+// 并行启动下一个后端（可连续对冲，每个间隔一个 hedgeDelay），先返回可用
+// 结果者胜出，其余在途请求取消。后端出错时立刻补位（这是 failover，不等
+// 对冲计时器）。
+//
+// 延迟收益来自链路延迟分布的长尾：首后端（如 wbmux）p99 数秒时，第二后端
+// （如 ddg）亚秒级响应的概率很高，竞速把端到端延迟从「首后端的全延迟」
+// 压到「对冲点 + 次后端延迟」。代价是可能多打一次上游请求——对按量计费的
+// 后端（tavily/brave）意味着落败方也可能计费，把它们排在链尾即可。
+func (c *backendChain) searchHedged(ctx context.Context, query string, limit int, key string) ([]searchResult, string, error) {
+	type outcome struct {
+		name    string
+		results []searchResult
+		stats   curationStats
+		err     error
+	}
+
+	c.mu.Lock()
+	var candidates []searchBackend
+	for _, b := range c.backends {
+		if !c.inCooldownLocked(b.Name()) {
+			candidates = append(candidates, b)
+		}
+	}
+	c.mu.Unlock()
+	if len(candidates) == 0 {
+		return nil, "", fmt.Errorf("all search backends are in cooldown")
+	}
+
+	// 每个候选一个可取消上下文：胜出即取消其余在途请求。
+	ctxs := make([]context.Context, len(candidates))
+	cancels := make([]context.CancelFunc, len(candidates))
+	for i := range candidates {
+		ctxs[i], cancels[i] = context.WithCancel(ctx)
+	}
+	defer func() {
+		for _, cancel := range cancels {
+			cancel()
+		}
+	}()
+
+	ch := make(chan outcome, len(candidates))
+	started, inFlight := 0, 0
+	startNext := func() {
+		if started >= len(candidates) {
+			return
+		}
+		idx := started
+		started++
+		inFlight++
+		b := candidates[idx]
+		go func() {
+			begin := time.Now()
+			results, err := b.Search(ctxs[idx], query, limit)
+			if err != nil {
+				// 被取消的落败方不记失败（不是它的错）。
+				if ctxs[idx].Err() == nil {
+					log.Printf("[search] backend %s failed after %s: %v", b.Name(), time.Since(begin).Round(time.Millisecond), err)
+					c.markFailed(b.Name())
+				}
+				ch <- outcome{name: b.Name(), err: err}
+				return
+			}
+			curated, stats := curate(results, query, limit)
+			for i := range curated {
+				curated[i].sources = []string{b.Name()}
+			}
+			if len(curated) == 0 {
+				log.Printf("[search] backend %s returned only junk (good=%d partial=%d junk=%d deduped=%d), trying next",
+					b.Name(), stats.Good, stats.Partial, stats.Junk, stats.Deduped)
+				ch <- outcome{
+					name:  b.Name(),
+					err:   fmt.Errorf("backend %s returned only irrelevant results", b.Name()),
+					stats: stats,
+				}
+				return
+			}
+			ch <- outcome{name: b.Name(), results: curatedToResults(curated), stats: stats}
+		}()
+	}
+
+	startNext()
+	timer := time.NewTimer(c.hedgeDelay)
+	defer timer.Stop()
+
+	var lastErr error
+	for inFlight > 0 {
+		select {
+		case o := <-ch:
+			inFlight--
+			if o.err != nil {
+				lastErr = o.err
+				startNext() // 失败立刻补位
+				continue
+			}
+			c.markOK(o.name)
+			log.Printf("[search] backend %s won the race (%d results, %d still in flight)",
+				o.name, len(o.results), inFlight)
+			c.mu.Lock()
+			c.lastStats = o.stats
+			c.cache[key] = cacheEntry{results: o.results, storedAt: time.Now()}
+			c.mu.Unlock()
+			return o.results, o.name, nil
+		case <-timer.C:
+			if started < len(candidates) {
+				log.Printf("[search] hedge: backend %s still running, starting %s",
+					candidates[started-1].Name(), candidates[started].Name())
+				startNext()
+				timer.Reset(c.hedgeDelay)
+			}
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("all search backends failed")
 	}
 	return nil, "", lastErr
 }

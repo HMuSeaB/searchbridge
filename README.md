@@ -103,6 +103,7 @@ claude
 | `SB_SEARCH_CACHE_MIN` | `30` | 搜索结果缓存分钟数（同查询同条数直接命中） |
 | `SB_SEARCH_MERGE` | 空 | 设为 `1` 开启合并模式：多后端并行查询 + 共识加权 |
 | `SB_SEARCH_MERGE_WIDTH` | `3` | 合并模式同时查询的后端数 |
+| `SB_SEARCH_HEDGE_MS` | `1000` | 对冲窗口（毫秒）：首后端超时未果即并行启动下一个，先出可用结果者胜出；设为 `0` 关闭，退回串行 failover |
 
 示例——只用免费后端，searxng 优先：
 
@@ -117,6 +118,31 @@ export SB_SEARXNG_URL="http://127.0.0.1:8080"
 export SB_SEARCH_MERGE=1
 export SB_SEARCH_MERGE_WIDTH=3
 ```
+
+示例——对冲模式（默认开启，延迟优先）：链首放最全的源，链尾放最快的源，
+窗口内没有结果就并行竞速：
+
+```bash
+export SB_SEARCH_BACKENDS="remote,ddg,bing"   # 默认即为对冲模式
+export SB_SEARCH_HEDGE_MS=1000                # 首后端 1s 未返回就启动 ddg
+```
+
+### 三种链路模式
+
+| 模式 | 触发条件 | 行为 | 适用 |
+|---|---|---|---|
+| 合并（merge） | `SB_SEARCH_MERGE=1` | 固定并行查询 N 个后端，共识加权合并全部结果 | 质量优先，不在乎多打几次上游 |
+| 对冲（hedge） | `SB_SEARCH_HEDGE_MS>0`（默认 1000） | 串行起步，首后端超过窗口未返回即并行启动下一个，**先出可用结果者胜出**，落败方取消 | 延迟优先（默认） |
+| 串行（failover） | `SB_SEARCH_HEDGE_MS=0` | 一个失败/全垃圾才试下一个 | 配额敏感（每个上游只打一次） |
+
+对冲的延迟收益来自链路延迟分布的长尾：链首源（如 wbmux）p99 数秒时，
+链尾亚秒级源胜出的概率很高，端到端延迟从「链首全延迟」压到「窗口 + 次后端
+延迟」。实测（本机网络，链 `remote,ddg,bing`）：串行时 remote 单独
+3.8–4.2s；对冲模式下胜出耗时 0.8–2.5s。注意代价是可能多打一次上游请求——
+按量计费的后端（tavily/brave）落败方也可能计费，把它们排在链尾。
+
+后端出错或返回全垃圾时**立刻补位**（这是 failover，不等对冲计时器）；
+全垃圾不进入冷却，错误与空结果才冷却。
 
 ## 精选层
 
@@ -171,6 +197,7 @@ searchbridge bridges the two, and doesn't depend on any single search source:
 
 - **Chat requests** (no `web_search` tool) are forwarded byte-for-byte to your upstream model endpoint, streaming or not. Client-supplied auth headers are replaced with your configured upstream key.
 - **Search requests** (with a `web_search` tool) go through a prioritized backend chain — `remote` (wbmux-style Anthropic search endpoint), `ddg` (DuckDuckGo Lite), `bing`, `searxng`, `tavily`, `brave`. A failing backend is skipped for a 10-minute cooldown and the next one takes over. Results are synthesized into a standard Anthropic Message (or SSE event stream for streaming clients).
+- **Three chain modes**: `merge` (fixed parallel query of N backends with consensus-weighted merge — quality first), `hedge` (default: sequential start, but if the first backend hasn't answered within `SB_SEARCH_HEDGE_MS` the next one starts in parallel and the first usable result wins — latency first), and plain sequential `failover` (`SB_SEARCH_HEDGE_MS=0`). Backend errors or all-junk results fill the next slot immediately; all-junk never triggers cooldown.
 - **JSON endpoint**: `GET/POST /v1/search?q=...&n=5`, wire-compatible with wbmux's `/v1/search`, for scripts and MCP clients.
 
 Zero dependencies, single binary, configured entirely via environment variables — see the tables above.

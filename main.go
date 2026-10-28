@@ -43,6 +43,7 @@ type config struct {
 	searchCacheTTL  time.Duration // 搜索结果缓存时间
 	searchMerge     bool          // 合并模式：多后端并行查询 + 共识加权
 	searchMergeWide int           // 合并模式同时查询的后端数
+	searchHedge     time.Duration // 对冲窗口：首后端超时未果即并行启动下一个
 }
 
 func loadConfig() config {
@@ -59,6 +60,7 @@ func loadConfig() config {
 		searchCacheTTL:  time.Duration(envInt("SB_SEARCH_CACHE_MIN", 30)) * time.Minute,
 		searchMerge:     env("SB_SEARCH_MERGE", "") == "1",
 		searchMergeWide: envInt("SB_SEARCH_MERGE_WIDTH", 3),
+		searchHedge:     time.Duration(envInt("SB_SEARCH_HEDGE_MS", 1000)) * time.Millisecond,
 	}
 }
 
@@ -169,6 +171,7 @@ func newServer(cfg config) *server {
 	chain := newBackendChain(backends, cfg.searchCooldown, cfg.searchCacheTTL)
 	chain.merge = cfg.searchMerge
 	chain.mergeWidth = cfg.searchMergeWide
+	chain.hedgeDelay = cfg.searchHedge
 	return &server{
 		cfg:    cfg,
 		client: &http.Client{},
