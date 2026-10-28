@@ -1,10 +1,10 @@
 # searchbridge
 
-给任意 Anthropic Messages 端点**补上原生 `web_search`** 的本地网关。
+给任意 Anthropic Messages 端点**补上原生 `web_search`** 的本地网关，内置多搜索后端链。
 
 ZCode / Claude Code 等客户端调用联网搜索时，会发出一个只携带 `web_search` 服务端工具的旁路请求（side request），由模型提供方执行搜索。很多自定义模型端点（例如 StepFun）并不支持这个服务端工具；而 [wbmux](https://github.com/HMuSeaB/wbmux) 这类工具虽然提供搜索端点，却只处理搜索请求、不能当主端点用。
 
-searchbridge 把两者接起来：
+searchbridge 把两者接起来，并且不依赖任何单一搜索来源：
 
 ```
                  ┌─────────────────────────────┐
@@ -19,13 +19,14 @@ searchbridge 把两者接起来：
                  │   （带 web_search 工具）      │
                  │             │                │
                  │             ▼                │
-                 │      搜索端点                 │
-                 │      （如 wbmux）             │
+                 │      搜索后端链（自动故障转移） │
+                 │   remote → ddg → bing → ...  │
                  └─────────────────────────────┘
 ```
 
 - **普通对话**：字节级透传转发到上游模型端点，流式 / 非流式均原样返回，客户端自带的认证头会被替换为你配置的上游 Key。
-- **联网搜索**：识别请求中的 `web_search` 服务端工具，转发到搜索端点；搜索端点通常只返回 JSON（即使请求了 `stream:true`），searchbridge 会把它合成为标准 Anthropic SSE 事件流（`message_start` → `server_tool_use` → `web_search_tool_result` → `text`/`citations` → `message_delta` → `message_stop`），按流式解析的客户端可以直接消费。
+- **联网搜索**：识别请求中的 `web_search` 服务端工具，按优先级依次尝试搜索后端；某个后端失败后进入 10 分钟冷却期自动跳过，全部失败才报错。结果合成为标准 Anthropic Message（流式请求则合成 SSE：`message_start` → `server_tool_use` → `web_search_tool_result` → `message_delta` → `message_stop`），客户端按流式直接消费。
+- **结构化 JSON 端点**：`GET/POST /v1/search?q=关键词&n=5`，与 wbmux 的 `/v1/search` 格式兼容，可直接给脚本、MCP、Raycast 之类用。
 
 零第三方依赖，单二进制，全部配置通过环境变量完成。
 
@@ -37,7 +38,7 @@ go build -o searchbridge .
 export SB_LISTEN="127.0.0.1:8787"
 export SB_UPSTREAM_URL="https://api.stepfun.com/step_plan"   # 普通聊天转发目标
 export SB_UPSTREAM_API_KEY="sk-..."                          # 上游 Key（x-api-key）
-export SB_SEARCH_URL="http://127.0.0.1:55464/v1/search/messages"  # wbmux 搜索端点
+# 搜索后端链默认 remote,ddg,bing，零配置即可用
 
 ./searchbridge
 ```
@@ -64,18 +65,50 @@ claude
 
 ## 配置项
 
+### 基础
+
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `SB_LISTEN` | `127.0.0.1:8787` | 监听地址 |
 | `SB_UPSTREAM_URL` | 空 | 普通聊天转发目标（Anthropic Messages 兼容端点） |
 | `SB_UPSTREAM_API_KEY` | 空 | 上游 Key，以 `x-api-key` 头发送 |
 | `SB_UPSTREAM_BEARER` | 空 | 设为 `1` 时上游 Key 改以 `Authorization: Bearer` 发送 |
-| `SB_SEARCH_URL` | `http://127.0.0.1:55464/v1/search/messages` | 搜索端点 |
-| `SB_SEARCH_API_KEY` | 空 | 搜索端点 Key（wbmux 本机回环免密，可留空） |
+
+### 搜索后端链
+
+`SB_SEARCH_BACKENDS` 定义后端及优先级（逗号分隔，顺序即尝试顺序），默认 `remote,ddg,bing`：
+
+| 后端 | 费用 | 说明 | 相关配置 |
+|---|---|---|---|
+| `remote` | 免费* | wbmux 等 Anthropic 搜索端点（复用已登录凭据） | `SB_SEARCH_URL`、`SB_SEARCH_API_KEY`、`SB_SEARCH_MODEL` |
+| `ddg` | 免费 | DuckDuckGo Lite，无需 Key（海外可达） | `SB_DDG_URL` |
+| `bing` | 免费 | Bing 网页搜索，国内默认走 `cn.bing.com` | `SB_BING_HOST` |
+| `searxng` | 免费 | 自建 / 公共 SearXNG 实例（需开启 JSON API） | `SB_SEARXNG_URL` |
+| `tavily` | 免费额度 1000 次/月 | Tavily Search API | `SB_TAVILY_API_KEY`、`SB_TAVILY_URL` |
+| `brave` | 付费 | Brave Search API（2026 年起已无免费档，$5/1000 次） | `SB_BRAVE_API_KEY`、`SB_BRAVE_URL` |
+
+\* remote 免费的前提是 wbmux 桌面端在运行。
+
+其他搜索配置：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `SB_SEARCH_URL` | `http://127.0.0.1:55464/v1/search/messages` | remote 后端地址；设为 `off` 可禁用 |
+| `SB_SEARCH_API_KEY` | 空 | remote 后端 Key（wbmux 本机回环免密） |
+| `SB_SEARCH_MODEL` | `web-search` | 请求 remote 时使用的模型名 |
+| `SB_SEARCH_COOLDOWN_MIN` | `10` | 后端失败后的冷却分钟数 |
+| `SB_SEARCH_CACHE_MIN` | `30` | 搜索结果缓存分钟数（同查询同条数直接命中） |
+
+示例——只用免费后端，searxng 优先：
+
+```bash
+export SB_SEARCH_BACKENDS="searxng,ddg,bing"
+export SB_SEARXNG_URL="http://127.0.0.1:8080"
+```
 
 ## 路由判定
 
-请求 `tools` 数组中任意工具满足以下任一条件即判定为联网搜索请求，转发至搜索端点：
+请求 `tools` 数组中任意工具满足以下任一条件即判定为联网搜索请求：
 
 - `name == "web_search"`（Anthropic 服务端工具的标准命名）
 - `type` 以 `web_search_` 开头（如 `web_search_20250305`、`web_search_20260209`）
@@ -86,15 +119,16 @@ claude
 
 | 路径 | 行为 |
 |---|---|
-| `POST /v1/messages` | 按路由判定分流 |
+| `POST /v1/messages` | 按路由判定分流（聊天 / 搜索） |
 | `POST /v1/messages/count_tokens` | 转发上游 |
 | `GET /v1/models` | 转发上游 |
-| `GET /healthz` | 健康检查，返回当前路由配置 |
+| `GET/POST /v1/search?q=&n=` | 结构化 JSON 搜索，走后端链 |
+| `GET /healthz` | 健康检查，返回当前路由与后端链 |
 
 ## 开发
 
 ```bash
-go test ./...   # 运行测试
+go test ./...   # 运行测试（后端解析、链路故障转移/冷却/缓存、路由、SSE 合成）
 go vet ./...    # 静态检查
 ```
 
@@ -106,16 +140,17 @@ MIT
 
 ## English
 
-**searchbridge** is a local gateway that adds native `web_search` support to any Anthropic Messages-compatible endpoint.
+**searchbridge** is a local gateway that adds native `web_search` support to any Anthropic Messages-compatible endpoint, with a built-in multi-backend search chain.
 
 When ZCode / Claude Code perform a web search, they send a side request carrying only the `web_search` server tool, expecting the model provider to execute the search. Many custom endpoints (e.g. StepFun) don't support that server tool, while tools like [wbmux](https://github.com/HMuSeaB/wbmux) provide a search endpoint that only handles search requests and can't serve as the main endpoint.
 
-searchbridge bridges the two:
+searchbridge bridges the two, and doesn't depend on any single search source:
 
 - **Chat requests** (no `web_search` tool) are forwarded byte-for-byte to your upstream model endpoint, streaming or not. Client-supplied auth headers are replaced with your configured upstream key.
-- **Search requests** (with a `web_search` tool) are forwarded to the search endpoint. Since search endpoints usually return plain JSON even when streaming was requested, searchbridge synthesizes the standard Anthropic SSE event sequence so streaming clients can consume it directly.
+- **Search requests** (with a `web_search` tool) go through a prioritized backend chain — `remote` (wbmux-style Anthropic search endpoint), `ddg` (DuckDuckGo Lite), `bing`, `searxng`, `tavily`, `brave`. A failing backend is skipped for a 10-minute cooldown and the next one takes over. Results are synthesized into a standard Anthropic Message (or SSE event stream for streaming clients).
+- **JSON endpoint**: `GET/POST /v1/search?q=...&n=5`, wire-compatible with wbmux's `/v1/search`, for scripts and MCP clients.
 
-Zero dependencies, single binary, configured entirely via environment variables — see the table above.
+Zero dependencies, single binary, configured entirely via environment variables — see the tables above.
 
 ```bash
 go build -o searchbridge .

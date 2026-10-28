@@ -21,6 +21,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -35,8 +36,11 @@ type config struct {
 	upstreamAPIKey string // 上游 API Key（可选，以 x-api-key 发送）
 	upstreamBearer bool   // true 时以 Authorization: Bearer 发送上游 Key
 
-	searchURL    string // 搜索端点，默认 http://127.0.0.1:55464/v1/search/messages
-	searchAPIKey string // 搜索端点 Key（可选；wbmux 本机回环免密）
+	searchURL      string        // 搜索端点（remote 后端），默认 wbmux 的 /v1/search/messages
+	searchAPIKey   string        // 搜索端点 Key（可选；wbmux 本机回环免密）
+	searchBackends string        // 搜索后端链（顺序即优先级），默认 remote,ddg,bing
+	searchCooldown time.Duration // 后端失败后的冷却时间
+	searchCacheTTL time.Duration // 搜索结果缓存时间
 }
 
 func loadConfig() config {
@@ -45,8 +49,12 @@ func loadConfig() config {
 		upstreamURL:    strings.TrimRight(env("SB_UPSTREAM_URL", ""), "/"),
 		upstreamAPIKey: env("SB_UPSTREAM_API_KEY", ""),
 		upstreamBearer: env("SB_UPSTREAM_BEARER", "") == "1",
-		searchURL:      env("SB_SEARCH_URL", "http://127.0.0.1:55464/v1/search/messages"),
+
+		searchURL:      searchURLEnv(),
 		searchAPIKey:   env("SB_SEARCH_API_KEY", ""),
+		searchBackends: env("SB_SEARCH_BACKENDS", ""),
+		searchCooldown: time.Duration(envInt("SB_SEARCH_COOLDOWN_MIN", 10)) * time.Minute,
+		searchCacheTTL: time.Duration(envInt("SB_SEARCH_CACHE_MIN", 30)) * time.Minute,
 	}
 }
 
@@ -55,6 +63,29 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
+// searchURLEnv 读取搜索端点；未设置时默认指向本机 wbmux，
+// 设为 off/none/- 可显式禁用 remote 后端。
+func searchURLEnv() string {
+	v := strings.TrimSpace(os.Getenv("SB_SEARCH_URL"))
+	switch strings.ToLower(v) {
+	case "off", "none", "-":
+		return ""
+	case "":
+		return "http://127.0.0.1:55464/v1/search/messages"
+	default:
+		return v
+	}
 }
 
 // ---------- Anthropic 协议结构（只取需要的字段） ----------
@@ -73,13 +104,13 @@ type anthropicTool struct {
 
 type contentBlock struct {
 	Type       string          `json:"type"`
-	Text       string          `json:"text"`
-	ID         string          `json:"id"`
-	Name       string          `json:"name"`
-	ToolUseID  string          `json:"tool_use_id"`
-	Content    json.RawMessage `json:"content"`
-	Citations  json.RawMessage `json:"citations"`
-	StopReason string          `json:"stop_reason"`
+	Text       string          `json:"text,omitempty"`
+	ID         string          `json:"id,omitempty"`
+	Name       string          `json:"name,omitempty"`
+	ToolUseID  string          `json:"tool_use_id,omitempty"`
+	Content    json.RawMessage `json:"content,omitempty"`
+	Citations  json.RawMessage `json:"citations,omitempty"`
+	StopReason string          `json:"stop_reason,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -125,20 +156,24 @@ func hasWebSearchTool(raw json.RawMessage) bool {
 type server struct {
 	cfg    config
 	client *http.Client
+	chain  *backendChain
 	nextID atomic.Uint64
 }
 
 func newServer(cfg config) *server {
+	backends := buildBackends(cfg)
+	chain := newBackendChain(backends, cfg.searchCooldown, cfg.searchCacheTTL)
 	return &server{
-		cfg: cfg,
-		// 不设整体超时：LLM 流式响应可能持续很久，由请求上下文负责取消。
+		cfg:    cfg,
 		client: &http.Client{},
+		chain:  chain,
 	}
 }
 
 func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/v1/search", s.handleSearchJSON) // 结构化 JSON 搜索端点（脚本 / MCP 用）
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/", s.handleMessages) // /v1/messages、/v1/messages/count_tokens 等
 	mux.HandleFunc("/", s.handleMessages)
@@ -151,6 +186,7 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"service":  "searchbridge",
 		"upstream": s.cfg.upstreamURL,
 		"search":   s.cfg.searchURL,
+		"backends": s.chain.Names(),
 	})
 }
 
@@ -214,61 +250,147 @@ func (s *server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 // ---------- 搜索路由 ----------
 
-// handleSearch 把 web_search 旁路请求转发到搜索端点。
-// 搜索端点通常只返回 JSON（即使请求了 stream），这里按需合成为 SSE。
+// extractSearchQuery 从 WebSearch 旁路请求中提取搜索词。
+// ZCode / Claude Code 的旁路请求形态：user 消息为
+// "Perform a web search for the query: <query>"。
+func extractSearchQuery(body []byte) string {
+	var req struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return ""
+	}
+	var lastUser string
+	for _, m := range req.Messages {
+		if m.Role != "user" {
+			continue
+		}
+		// content 可能是字符串或内容块数组，两种都支持。
+		var s string
+		if json.Unmarshal(m.Content, &s) == nil {
+			lastUser = s
+			continue
+		}
+		var blocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(m.Content, &blocks) == nil {
+			for _, b := range blocks {
+				if b.Type == "text" && b.Text != "" {
+					lastUser = b.Text
+				}
+			}
+		}
+	}
+	const marker = "Perform a web search for the query:"
+	if i := strings.Index(lastUser, marker); i != -1 {
+		return strings.TrimSpace(lastUser[i+len(marker):])
+	}
+	return strings.TrimSpace(lastUser)
+}
+
+// searchLimit 从请求声明的 web_search 工具中取 max_uses 作为结果条数。
+func searchLimit(body []byte) int {
+	var req anthropicRequest
+	if err := json.Unmarshal(body, &req); err != nil || len(req.Tools) == 0 {
+		return 5
+	}
+	var tools []struct {
+		Type    string `json:"type"`
+		Name    string `json:"name"`
+		MaxUses int    `json:"max_uses"`
+	}
+	if json.Unmarshal(req.Tools, &tools) != nil {
+		return 5
+	}
+	for _, t := range tools {
+		if t.Name == "web_search" || strings.HasPrefix(t.Type, "web_search_") {
+			if t.MaxUses >= 1 && t.MaxUses <= 10 {
+				return t.MaxUses
+			}
+			return 5
+		}
+	}
+	return 5
+}
+
+// handleSearch 处理 WebSearch 旁路请求：通过后端链路取结果，合成为
+// Anthropic Message（流式请求则合成 SSE）。
 func (s *server) handleSearch(w http.ResponseWriter, r *http.Request, body []byte, req anthropicRequest) {
-	if s.cfg.searchURL == "" {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "SB_SEARCH_URL is not configured")
+	query := extractSearchQuery(body)
+	if len(query) < 2 {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "search query is empty or too short")
 		return
 	}
+	limit := searchLimit(body)
 
-	resp, err := s.do(r.Context(), http.MethodPost, s.cfg.searchURL, body, s.searchHeaders(r))
+	start := time.Now()
+	results, via, err := s.chain.Search(r.Context(), query, limit)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "search endpoint unreachable: "+err.Error())
+		writeAnthropicError(w, http.StatusBadGateway, "api_error",
+			"all search backends failed: "+err.Error())
 		return
 	}
-	defer resp.Body.Close()
+	log.Printf("[search] query=%q limit=%d via=%s (%d results, %s)", query, limit, via, len(results), time.Since(start).Round(time.Millisecond))
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to read search response")
-		return
-	}
-
-	if resp.StatusCode >= 400 {
-		// 上游错误（如搜索端点不可用）原样透传状态与错误体。
-		w.Header().Set("content-type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(respBody)
-		return
-	}
-
-	// 搜索端点万一直接返回了 SSE 流，原样透传。
-	if strings.Contains(resp.Header.Get("content-type"), "event-stream") {
-		w.Header().Set("content-type", "text/event-stream")
-		w.Header().Set("cache-control", "no-cache")
-		w.Header().Set("connection", "keep-alive")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(respBody)
-		return
-	}
-
-	var msg anthropicMessage
-	if err := json.Unmarshal(respBody, &msg); err != nil {
-		// 不是标准 Message 结构时按纯 JSON 透传，避免吞掉响应。
-		w.Header().Set("content-type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(respBody)
-		return
-	}
-
+	msg := buildSearchMessage(req.Model, query, results)
 	if req.Stream {
 		s.writeSearchAsSSE(w, &msg)
 		return
 	}
-	w.Header().Set("content-type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(respBody)
+	writeJSON(w, http.StatusOK, msg)
+}
+
+// handleSearchJSON 提供结构化 JSON 搜索端点（与 wbmux 的 /v1/search 兼容）：
+// GET/POST /v1/search?q=关键词&n=5
+func (s *server) handleSearchJSON(w http.ResponseWriter, r *http.Request) {
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	limit := 5
+	if n := r.URL.Query().Get("n"); n != "" {
+		if v, err := strconv.Atoi(n); err == nil && v >= 1 && v <= 10 {
+			limit = v
+		}
+	}
+	if query == "" && r.Method == http.MethodPost {
+		var payload struct {
+			Query string `json:"q"`
+			Limit int    `json:"n"`
+		}
+		if json.NewDecoder(r.Body).Decode(&payload) == nil {
+			query = strings.TrimSpace(payload.Query)
+			if payload.Limit >= 1 && payload.Limit <= 10 {
+				limit = payload.Limit
+			}
+		}
+	}
+	if len(query) < 2 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": "query parameter 'q' is required (min 2 chars)",
+		})
+		return
+	}
+
+	start := time.Now()
+	results, via, err := s.chain.Search(r.Context(), query, limit)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"ok":    false,
+			"error": "all search backends failed: " + err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":               true,
+		"query":            query,
+		"via":              via,
+		"results":          results,
+		"response_time_ms": time.Since(start).Milliseconds(),
+	})
 }
 
 // writeSearchAsSSE 把搜索端点返回的完整 Message 合成为 Anthropic SSE 事件序列，
@@ -464,12 +586,6 @@ func (s *server) upstreamHeaders(r *http.Request) map[string]string {
 	return h
 }
 
-func (s *server) searchHeaders(r *http.Request) map[string]string {
-	h := forwardHeaders(r)
-	applyKey(h, s.cfg.searchAPIKey, false)
-	return h
-}
-
 // forwardHeaders 复制客户端请求头，但替换掉客户端自带的上游认证信息。
 func forwardHeaders(r *http.Request) map[string]string {
 	skip := map[string]bool{
@@ -528,16 +644,17 @@ func main() {
 	if cfg.upstreamURL == "" {
 		log.Printf("[warn] SB_UPSTREAM_URL 未配置：普通聊天请求将返回 502，仅搜索可用")
 	}
+	srv := newServer(cfg)
 	log.Printf("searchbridge listening on http://%s", cfg.listenAddr)
-	log.Printf("  chat   -> %s", valueOr(cfg.upstreamURL, "(未配置)"))
-	log.Printf("  search -> %s", valueOr(cfg.searchURL, "(未配置)"))
+	log.Printf("  chat    -> %s", valueOr(cfg.upstreamURL, "(未配置)"))
+	log.Printf("  search  -> 后端链: %s", strings.Join(srv.chain.Names(), " -> "))
 
-	srv := &http.Server{
+	httpSrv := &http.Server{
 		Addr:              cfg.listenAddr,
-		Handler:           newServer(cfg).routes(),
+		Handler:           srv.routes(),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
-	if err := srv.ListenAndServe(); err != nil {
+	if err := httpSrv.ListenAndServe(); err != nil {
 		log.Fatalf("server exited: %v", err)
 	}
 }

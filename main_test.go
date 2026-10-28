@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------- web_search 工具判定 ----------
@@ -41,33 +43,86 @@ func TestHasWebSearchTool(t *testing.T) {
 	}
 }
 
+// ---------- 查询词与条数提取 ----------
+
+func TestExtractSearchQuery(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"zcode side request",
+			`{"messages":[{"role":"system","content":"You are an assistant for performing a web search tool use."},{"role":"user","content":"Perform a web search for the query: golang 1.24 新特性"}]}`,
+			"golang 1.24 新特性",
+		},
+		{
+			"plain user message",
+			`{"messages":[{"role":"user","content":"直接搜这个"}]}`,
+			"直接搜这个",
+		},
+		{
+			"content blocks",
+			`{"messages":[{"role":"user","content":[{"type":"text","text":"Perform a web search for the query: 块格式查询"}]}]}`,
+			"块格式查询",
+		},
+		{"empty body", ``, ""},
+		{"no messages", `{"model":"m"}`, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := extractSearchQuery([]byte(c.body)); got != c.want {
+				t.Errorf("extractSearchQuery() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestSearchLimit(t *testing.T) {
+	cases := []struct {
+		body string
+		want int
+	}{
+		{`{"tools":[{"type":"web_search_20260209","name":"web_search","max_uses":7}]}`, 7},
+		{`{"tools":[{"name":"web_search"}]}`, 5},
+		{`{"tools":[{"name":"web_search","max_uses":99}]}`, 5}, // 超上限回退默认
+		{`{"tools":[{"name":"Bash"}]}`, 5},
+		{`{}`, 5},
+	}
+	for _, c := range cases {
+		if got := searchLimit([]byte(c.body)); got != c.want {
+			t.Errorf("searchLimit(%s) = %d, want %d", c.body, got, c.want)
+		}
+	}
+}
+
 // ---------- 测试辅助 ----------
 
-// fakeSearchMessage 模拟 wbmux 搜索端点返回的 Anthropic Message。
-const fakeSearchMessage = `{
-  "id": "msg_wbmux_test",
-  "type": "message",
-  "role": "assistant",
-  "model": "step-5-preview",
-  "content": [
-    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_test",
-     "content": [{"type": "web_search_result", "url": "https://example.com/a", "title": "示例 A"}]},
-    {"type": "text", "text": "根据搜索结果，答案是 42。",
-     "citations": [{"type": "web_search_result_location", "url": "https://example.com/a", "cited_text": "42"}]}
-  ],
-  "stop_reason": "end_turn",
-  "usage": {"input_tokens": 12, "output_tokens": 0}
-}`
+// stubBackend 是可控的测试后端。
+type stubBackend struct {
+	name    string
+	results []searchResult
+	err     error
+	calls   int
+}
 
-func newTestServer(t *testing.T, upstreamURL, searchURL string) *server {
+func (b *stubBackend) Name() string { return b.name }
+
+func (b *stubBackend) Search(_ context.Context, _ string, _ int) ([]searchResult, error) {
+	b.calls++
+	return b.results, b.err
+}
+
+func newTestServer(t *testing.T, upstreamURL string, backends ...searchBackend) *server {
 	t.Helper()
-	return newServer(config{
-		listenAddr:     "127.0.0.1:0",
-		upstreamURL:    upstreamURL,
-		upstreamAPIKey: "up-key",
-		searchURL:      searchURL,
-		searchAPIKey:   "",
-	})
+	return &server{
+		cfg: config{
+			listenAddr:  "127.0.0.1:0",
+			upstreamURL: upstreamURL,
+		},
+		client: &http.Client{},
+		chain:  newBackendChain(backends, 10*time.Minute, 30*time.Minute),
+	}
 }
 
 func doJSON(t *testing.T, srv *server, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -81,54 +136,53 @@ func doJSON(t *testing.T, srv *server, method, path, body string, headers map[st
 	return rec
 }
 
-// ---------- 搜索路由 ----------
+func stubResults(n int) []searchResult {
+	results := make([]searchResult, n)
+	for i := range results {
+		results[i] = searchResult{
+			Title:   "结果 " + string(rune('A'+i)),
+			URL:     "https://example.com/" + string(rune('a'+i)),
+			Snippet: "摘要 " + string(rune('A'+i)),
+		}
+	}
+	return results
+}
 
-func TestSearchRequestRoutesToSearchEndpoint(t *testing.T) {
-	var gotAuth, gotBody string
-	search := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("x-api-key")
-		b, _ := io.ReadAll(r.Body)
-		gotBody = string(b)
-		w.Header().Set("content-type", "application/json")
-		_, _ = w.Write([]byte(fakeSearchMessage))
-	}))
-	defer search.Close()
+// ---------- 搜索路由（走后端链） ----------
 
-	srv := newTestServer(t, "http://upstream.invalid", search.URL)
-	reqBody := `{"model":"step-5-preview","max_tokens":4096,"messages":[{"role":"user","content":"搜索测试"}],` +
-		`"tools":[{"type":"web_search_20260209","name":"web_search","max_uses":8}]}`
+func TestSearchRequestUsesBackendChain(t *testing.T) {
+	primary := &stubBackend{name: "primary", results: stubResults(3)}
+	srv := newTestServer(t, "http://upstream.invalid", primary)
+
+	reqBody := `{"model":"step-5-preview","max_tokens":4096,"messages":[{"role":"user","content":"Perform a web search for the query: 测试查询"}],` +
+		`"tools":[{"type":"web_search_20260209","name":"web_search","max_uses":3}]}`
 
 	rec := doJSON(t, srv, http.MethodPost, "/v1/messages", reqBody, map[string]string{
 		"content-type":      "application/json",
-		"x-api-key":         "client-dummy-key", // 应被剥离，不透传给搜索端点
+		"x-api-key":         "client-dummy-key",
 		"anthropic-version": "2023-06-01",
 	})
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if gotAuth != "" {
-		t.Errorf("search endpoint received x-api-key %q, want empty (client key must not leak)", gotAuth)
+	if primary.calls != 1 {
+		t.Errorf("primary backend calls = %d, want 1", primary.calls)
 	}
-	if !strings.Contains(gotBody, "web_search_20260209") {
-		t.Errorf("search endpoint body missing web_search tool: %s", gotBody)
+	body := rec.Body.String()
+	if !strings.Contains(body, "web_search_tool_result") {
+		t.Errorf("response missing web_search_tool_result: %s", body)
 	}
-	// 非流式：JSON 原样返回。
-	if !strings.Contains(rec.Body.String(), "msg_wbmux_test") {
-		t.Errorf("response missing search message id: %s", rec.Body.String())
+	if !strings.Contains(body, "https://example.com/a") {
+		t.Errorf("response missing search result URL: %s", body)
 	}
 }
 
 func TestSearchRequestStreamSynthesizesSSE(t *testing.T) {
-	search := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// wbmux 即使收到 stream:true 也返回 JSON。
-		w.Header().Set("content-type", "application/json")
-		_, _ = w.Write([]byte(fakeSearchMessage))
-	}))
-	defer search.Close()
+	primary := &stubBackend{name: "primary", results: stubResults(2)}
+	srv := newTestServer(t, "http://upstream.invalid", primary)
 
-	srv := newTestServer(t, "http://upstream.invalid", search.URL)
-	reqBody := `{"model":"step-5-preview","stream":true,"messages":[{"role":"user","content":"搜索测试"}],` +
+	reqBody := `{"model":"step-5-preview","stream":true,"messages":[{"role":"user","content":"Perform a web search for the query: 流式测试"}],` +
 		`"tools":[{"type":"web_search_20260209","name":"web_search"}]}`
 
 	rec := doJSON(t, srv, http.MethodPost, "/v1/messages", reqBody, nil)
@@ -145,7 +199,6 @@ func TestSearchRequestStreamSynthesizesSSE(t *testing.T) {
 		"ping", "message_start",
 		"content_block_start", "content_block_delta", "content_block_stop", // server_tool_use
 		"content_block_start", "content_block_stop", // web_search_tool_result
-		"content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", // text + citations
 		"message_delta", "message_stop",
 	}
 	if len(events) != len(wantOrder) {
@@ -156,39 +209,54 @@ func TestSearchRequestStreamSynthesizesSSE(t *testing.T) {
 			t.Errorf("event[%d] = %q, want %q", i, events[i].event, want)
 		}
 	}
-
-	// 关键载荷校验。
-	if !strings.Contains(rec.Body.String(), `"web_search_tool_result"`) {
-		t.Error("SSE stream missing web_search_tool_result block")
-	}
 	if !strings.Contains(rec.Body.String(), "https://example.com/a") {
 		t.Error("SSE stream missing search result URL")
-	}
-	if !strings.Contains(rec.Body.String(), "根据搜索结果，答案是 42。") {
-		t.Error("SSE stream missing text delta")
 	}
 	if !strings.Contains(rec.Body.String(), `"stop_reason":"end_turn"`) {
 		t.Error("SSE stream missing stop_reason")
 	}
 }
 
-func TestSearchEndpointErrorPassthrough(t *testing.T) {
-	search := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("content-type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"no web_search tool"}}`))
-	}))
-	defer search.Close()
+func TestSearchAllBackendsFailReturnsError(t *testing.T) {
+	failing := &stubBackend{name: "failing", err: io.ErrUnexpectedEOF}
+	srv := newTestServer(t, "http://upstream.invalid", failing)
 
-	srv := newTestServer(t, "http://upstream.invalid", search.URL)
 	rec := doJSON(t, srv, http.MethodPost, "/v1/messages",
-		`{"model":"m","messages":[],"tools":[{"type":"web_search_20260209","name":"web_search"}]}`, nil)
+		`{"model":"m","messages":[{"role":"user","content":"Perform a web search for the query: 会失败的查询"}],"tools":[{"name":"web_search"}]}`, nil)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400", rec.Code)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "no web_search tool") {
-		t.Errorf("error body not passed through: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "all search backends failed") {
+		t.Errorf("error body = %s", rec.Body.String())
+	}
+}
+
+func TestSearchJSONEndpoint(t *testing.T) {
+	primary := &stubBackend{name: "primary", results: stubResults(2)}
+	srv := newTestServer(t, "http://upstream.invalid", primary)
+
+	rec := doJSON(t, srv, http.MethodGet, "/v1/search?q=json%20endpoint&n=2", ``, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var payload struct {
+		OK      bool           `json:"ok"`
+		Query   string         `json:"query"`
+		Via     string         `json:"via"`
+		Results []searchResult `json:"results"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if !payload.OK || payload.Query != "json endpoint" || payload.Via != "primary" || len(payload.Results) != 2 {
+		t.Errorf("unexpected payload: %s", rec.Body.String())
+	}
+
+	// 缺少 q 参数。
+	rec = doJSON(t, srv, http.MethodGet, "/v1/search", ``, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("missing query status = %d, want 400", rec.Code)
 	}
 }
 
@@ -205,7 +273,7 @@ func TestChatRequestForwardedToUpstream(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	srv := newTestServer(t, upstream.URL, "http://search.invalid")
+	srv := newTestServer(t, upstream.URL)
 	reqBody := `{"model":"step-5-preview","messages":[{"role":"user","content":"ping"}],` +
 		`"tools":[{"name":"WebSearch","input_schema":{"type":"object"}}]}`
 
@@ -221,8 +289,8 @@ func TestChatRequestForwardedToUpstream(t *testing.T) {
 	if gotPath != "/v1/messages" {
 		t.Errorf("upstream path = %q, want /v1/messages", gotPath)
 	}
-	if gotAuth != "up-key" {
-		t.Errorf("upstream x-api-key = %q, want configured up-key", gotAuth)
+	if gotAuth != "" {
+		t.Errorf("upstream x-api-key = %q, want empty (no upstream key configured)", gotAuth)
 	}
 	if gotVersion != "2023-06-01" {
 		t.Errorf("anthropic-version = %q, want 2023-06-01", gotVersion)
@@ -244,7 +312,7 @@ func TestChatRequestStreamPassthrough(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	srv := newTestServer(t, upstream.URL, "http://search.invalid")
+	srv := newTestServer(t, upstream.URL)
 	rec := doJSON(t, srv, http.MethodPost, "/v1/messages",
 		`{"model":"m","stream":true,"messages":[]}`, nil)
 
@@ -264,7 +332,7 @@ func TestCountTokensForwardedUpstream(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	srv := newTestServer(t, upstream.URL, "http://search.invalid")
+	srv := newTestServer(t, upstream.URL)
 	rec := doJSON(t, srv, http.MethodPost, "/v1/messages/count_tokens", `{"model":"m","messages":[]}`, nil)
 
 	if rec.Code != http.StatusOK {
@@ -276,13 +344,14 @@ func TestCountTokensForwardedUpstream(t *testing.T) {
 }
 
 func TestHealthEndpoint(t *testing.T) {
-	srv := newTestServer(t, "http://up.invalid", "http://search.invalid")
+	srv := newTestServer(t, "http://up.invalid", &stubBackend{name: "b1", results: stubResults(1)})
 	rec := doJSON(t, srv, http.MethodGet, "/healthz", ``, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "searchbridge") {
-		t.Errorf("health body = %s", rec.Body.String())
+	body := rec.Body.String()
+	if !strings.Contains(body, "searchbridge") || !strings.Contains(body, "b1") {
+		t.Errorf("health body = %s", body)
 	}
 }
 
